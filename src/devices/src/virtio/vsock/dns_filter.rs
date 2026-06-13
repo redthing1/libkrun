@@ -308,6 +308,45 @@ fn sockaddr_ip(addr: &SockaddrStorage) -> Option<IpAddr> {
     }
 }
 
+fn is_reserved_v4(v4: Ipv4Addr) -> bool {
+    v4.is_loopback()        // 127.0.0.0/8
+        || v4.is_link_local() // 169.254.0.0/16 — incl. 169.254.169.254 (cloud metadata)
+        || v4.is_private()    // 10/8, 172.16/12, 192.168/16 — host/control internal subnet
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || matches!(v4.octets(), [100, b, ..] if (64..=127).contains(&b)) // 100.64/10 CGNAT gateway
+}
+
+/// Platform egress hard-floor for the TSI path (mirrors smolvm-network's
+/// `EgressPolicy`): destinations the muxer must NEVER connect a guest to,
+/// regardless of the (optional) allow-list — the cloud metadata server, the
+/// host/control internal subnets, loopback, link-local, and the gateway CGNAT
+/// range. Stops a guest from stealing host credentials, pivoting to the control
+/// plane / worker node API, or reaching co-resident tenants. Non-IP (unix) dests
+/// are not floored. Override for trusted single-tenant/local use with
+/// `SMOLVM_EGRESS_ALLOW_PRIVATE=1`.
+pub(super) fn is_reserved_destination(addr: &SockaddrStorage) -> bool {
+    let allow_private = std::env::var("SMOLVM_EGRESS_ALLOW_PRIVATE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if allow_private {
+        return false;
+    }
+    let Some(ip) = sockaddr_ip(addr) else {
+        return false;
+    };
+    match ip {
+        IpAddr::V4(v4) => is_reserved_v4(v4),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+                || v6.to_ipv4_mapped().is_some_and(is_reserved_v4)
+        }
+    }
+}
+
 /// CIDR membership test. Public to the vsock module so the muxer can reuse it.
 pub(super) fn ip_matches_cidrs(ip: IpAddr, cidrs: &[(IpAddr, u8)]) -> bool {
     for (cidr_ip, prefix_len) in cidrs {
