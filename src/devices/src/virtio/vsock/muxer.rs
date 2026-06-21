@@ -164,10 +164,10 @@ impl VsockMuxer {
     /// the IP was learned from an allowed DNS answer. Fail-closed on a poisoned
     /// policy lock.
     fn is_ip_allowed(&self, addr: &SockaddrStorage) -> bool {
-        // Platform hard-floor: metadata/internal/loopback are denied regardless
-        // of the (optional) egress policy — so even a no-policy ("allow all")
-        // guest cannot reach the cloud metadata server, the host/control internal
-        // subnet, loopback, or the gateway range. Override with
+        // Platform hard-floor, applied regardless of the (optional) egress
+        // policy. Scope follows the deployment context (FloorMode): locally only
+        // the cloud-metadata range is denied (the LAN stays reachable); under
+        // fleet mode the full internal floor applies. Override with
         // SMOLVM_EGRESS_ALLOW_PRIVATE=1 for trusted single-tenant/local use.
         if super::dns_filter::is_reserved_destination(addr) {
             return false;

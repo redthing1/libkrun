@@ -308,6 +308,55 @@ fn sockaddr_ip(addr: &SockaddrStorage) -> Option<IpAddr> {
     }
 }
 
+/// How much of the platform egress floor applies, resolved once from the
+/// deployment context (mirrors smolvm-network's `FloorMode`) — NOT a blanket
+/// default-deny. A local VM reaching the host's own LAN is legitimate, so the
+/// broad internal-subnet floor is reserved for the multi-tenant context.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FloorMode {
+    /// `SMOLVM_EGRESS_ALLOW_PRIVATE=1`: floor nothing.
+    Off,
+    /// Local default: deny ONLY the cloud-metadata link-local range
+    /// (169.254.0.0/16) — the canonical SSRF target — while the LAN stays
+    /// reachable, so local behavior is reasonable and clear.
+    MetadataOnly,
+    /// `SMOLVM_PUBLISH_ADDR` (fleet/multi-tenant): the full floor — metadata,
+    /// internal subnets, loopback, link/unique-local, and the CGNAT range.
+    Strict,
+}
+
+/// Resolve the floor from the env, cached for the VM's lifetime (the env doesn't
+/// change), so the muxer never reads it on the per-connect/per-datagram path.
+fn floor_mode() -> FloorMode {
+    use std::sync::OnceLock;
+    static MODE: OnceLock<FloorMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let allow_private = std::env::var("SMOLVM_EGRESS_ALLOW_PRIVATE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if allow_private {
+            FloorMode::Off
+        } else if std::env::var_os("SMOLVM_PUBLISH_ADDR").is_some() {
+            FloorMode::Strict
+        } else {
+            FloorMode::MetadataOnly
+        }
+    })
+}
+
+/// The cloud-metadata link-local range — floored in every mode except `Off`,
+/// including via an IPv4-mapped IPv6 address.
+fn is_link_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_link_local())
+        }
+    }
+}
+
+/// The full multi-tenant IPv4 floor.
 fn is_reserved_v4(v4: Ipv4Addr) -> bool {
     v4.is_loopback()        // 127.0.0.0/8
         || v4.is_link_local() // 169.254.0.0/16 — incl. 169.254.169.254 (cloud metadata)
@@ -317,34 +366,34 @@ fn is_reserved_v4(v4: Ipv4Addr) -> bool {
         || matches!(v4.octets(), [100, b, ..] if (64..=127).contains(&b)) // 100.64/10 CGNAT gateway
 }
 
+/// Whether `ip` is floored under `mode` — the pure, testable predicate.
+fn is_floored(ip: IpAddr, mode: FloorMode) -> bool {
+    match mode {
+        FloorMode::Off => false,
+        FloorMode::MetadataOnly => is_link_local(ip),
+        FloorMode::Strict => match ip {
+            IpAddr::V4(v4) => is_reserved_v4(v4),
+            IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+                    || v6.to_ipv4_mapped().is_some_and(is_reserved_v4)
+            }
+        },
+    }
+}
+
 /// Platform egress hard-floor for the TSI path (mirrors smolvm-network's
 /// `EgressPolicy`): destinations the muxer must NEVER connect a guest to,
-/// regardless of the (optional) allow-list — the cloud metadata server, the
-/// host/control internal subnets, loopback, link-local, and the gateway CGNAT
-/// range. Stops a guest from stealing host credentials, pivoting to the control
-/// plane / worker node API, or reaching co-resident tenants. Non-IP (unix) dests
-/// are not floored. Override for trusted single-tenant/local use with
-/// `SMOLVM_EGRESS_ALLOW_PRIVATE=1`.
+/// regardless of the (optional) allow-list. Scope follows `FloorMode` — only the
+/// cloud-metadata range locally, the full internal floor under fleet mode.
+/// Non-IP (unix) dests are not floored.
 pub(super) fn is_reserved_destination(addr: &SockaddrStorage) -> bool {
-    let allow_private = std::env::var("SMOLVM_EGRESS_ALLOW_PRIVATE")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if allow_private {
-        return false;
-    }
     let Some(ip) = sockaddr_ip(addr) else {
         return false;
     };
-    match ip {
-        IpAddr::V4(v4) => is_reserved_v4(v4),
-        IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
-                || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
-                || v6.to_ipv4_mapped().is_some_and(is_reserved_v4)
-        }
-    }
+    is_floored(ip, floor_mode())
 }
 
 /// CIDR membership test. Public to the vsock module so the muxer can reuse it.
@@ -783,5 +832,36 @@ mod tests {
     fn sockaddr_port_extracts_port() {
         assert_eq!(sockaddr_port(&sockaddr_v4(1, 1, 1, 1, 53)), Some(53));
         assert_eq!(sockaddr_port(&sockaddr_v4(1, 1, 1, 1, 853)), Some(853));
+    }
+
+    fn ip4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    #[test]
+    fn floor_off_blocks_nothing() {
+        for ip in [ip4(8, 8, 8, 8), ip4(169, 254, 169, 254), ip4(192, 168, 1, 5), ip4(127, 0, 0, 1)] {
+            assert!(!is_floored(ip, FloorMode::Off));
+        }
+    }
+
+    #[test]
+    fn floor_metadata_only_blocks_just_link_local() {
+        assert!(is_floored(ip4(169, 254, 169, 254), FloorMode::MetadataOnly));
+        for ip in [ip4(8, 8, 8, 8), ip4(192, 168, 1, 5), ip4(10, 0, 0, 7), ip4(127, 0, 0, 1)] {
+            assert!(!is_floored(ip, FloorMode::MetadataOnly), "{ip} reachable locally");
+        }
+        assert!(is_floored("::ffff:169.254.169.254".parse().unwrap(), FloorMode::MetadataOnly));
+    }
+
+    #[test]
+    fn floor_strict_blocks_internal_and_metadata() {
+        for ip in [ip4(169, 254, 169, 254), ip4(192, 168, 1, 5), ip4(10, 0, 0, 7), ip4(127, 0, 0, 1), ip4(100, 64, 0, 1)] {
+            assert!(is_floored(ip, FloorMode::Strict), "{ip} floored under Strict");
+        }
+        assert!(!is_floored(ip4(8, 8, 8, 8), FloorMode::Strict));
+        assert!(!is_floored(ip4(100, 128, 0, 1), FloorMode::Strict));
+        assert!(is_floored("fe80::1".parse().unwrap(), FloorMode::Strict));
+        assert!(is_floored("::ffff:10.0.0.1".parse().unwrap(), FloorMode::Strict));
     }
 }
