@@ -97,6 +97,9 @@ const APIC_VERSION: u8 = 0x14;
 const CPU_STEPPING: u32 = 0x600;
 const CPU_FEATURE_APIC: u32 = 0x200;
 const CPU_FEATURE_FPU: u32 = 0x001;
+// The userspace IOAPIC model exposes 24 input pins. Describe the full pin
+// range so virtio-mmio devices using IRQs above 15 are discoverable by Linux.
+const IOAPIC_NUM_PINS: usize = 24;
 
 fn compute_checksum<T: Copy>(v: &T) -> u8 {
     // Safe because we are only reading the bytes within the size of the `T` reference `v`.
@@ -119,7 +122,7 @@ fn compute_mp_size(num_cpus: u8) -> usize {
         + mem::size_of::<MpcCpuWrapper>() * (num_cpus as usize)
         + mem::size_of::<MpcIoapicWrapper>()
         + mem::size_of::<MpcBusWrapper>()
-        + mem::size_of::<MpcIntsrcWrapper>() * 16
+        + mem::size_of::<MpcIntsrcWrapper>() * IOAPIC_NUM_PINS
         + mem::size_of::<MpcLintsrcWrapper>() * 2
 }
 
@@ -215,16 +218,16 @@ pub fn setup_mptable(mem: &GuestMemoryMmap, num_cpus: u8) -> Result<()> {
         checksum = checksum.wrapping_add(compute_checksum(&mpc_ioapic.0));
     }
     // Per kvm_setup_default_irq_routing() in kernel
-    for i in 0..16 {
+    for i in 0..IOAPIC_NUM_PINS {
         let size = mem::size_of::<MpcIntsrcWrapper>() as u64;
         let mut mpc_intsrc = MpcIntsrcWrapper(mpspec::mpc_intsrc::default());
         mpc_intsrc.0.type_ = mpspec::MP_INTSRC as u8;
         mpc_intsrc.0.irqtype = mpspec::mp_irq_source_types_mp_INT as u8;
         mpc_intsrc.0.irqflag = mpspec::MP_IRQDIR_DEFAULT as u16;
         mpc_intsrc.0.srcbus = 0;
-        mpc_intsrc.0.srcbusirq = i;
+        mpc_intsrc.0.srcbusirq = i as u8;
         mpc_intsrc.0.dstapic = ioapicid;
-        mpc_intsrc.0.dstirq = i;
+        mpc_intsrc.0.dstirq = i as u8;
         mem.write_obj(mpc_intsrc, base_mp)
             .map_err(|_| Error::WriteMpcIntsrc)?;
         base_mp = base_mp.unchecked_add(size);
@@ -286,6 +289,7 @@ pub fn setup_mptable(mem: &GuestMemoryMmap, num_cpus: u8) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::x86_64::layout;
     use std::io;
     use std::io::Write;
     use vm_memory::Bytes;
@@ -414,6 +418,48 @@ mod tests {
             }
             assert_eq!(cpu_count, i);
         }
+    }
+
+    #[test]
+    fn intsrc_entries_cover_mmio_irq_range() {
+        let num_cpus = 4;
+        let mem = GuestMemoryMmap::from_ranges(&[(
+            GuestAddress(MPTABLE_START),
+            compute_mp_size(num_cpus),
+        )])
+        .unwrap();
+
+        setup_mptable(&mem, num_cpus).unwrap();
+
+        let mpf_intel: MpfIntelWrapper = mem.read_obj(GuestAddress(MPTABLE_START)).unwrap();
+        let mpc_offset = GuestAddress(u64::from(mpf_intel.0.physptr));
+        let mpc_table: MpcTableWrapper = mem.read_obj(mpc_offset).unwrap();
+        let mpc_end = mpc_offset
+            .checked_add(u64::from(mpc_table.0.length))
+            .unwrap();
+
+        let mut entry_offset = mpc_offset
+            .checked_add(mem::size_of::<MpcTableWrapper>() as u64)
+            .unwrap();
+        let mut intsrc_count = 0;
+        let mut max_dstirq = 0;
+
+        while entry_offset < mpc_end {
+            let entry_type: u8 = mem.read_obj(entry_offset).unwrap();
+            if u32::from(entry_type) == mpspec::MP_INTSRC {
+                let intsrc: MpcIntsrcWrapper = mem.read_obj(entry_offset).unwrap();
+                intsrc_count += 1;
+                max_dstirq = max_dstirq.max(intsrc.0.dstirq);
+            }
+            entry_offset = entry_offset
+                .checked_add(table_entry_size(entry_type) as u64)
+                .unwrap();
+            assert!(entry_offset <= mpc_end);
+        }
+
+        assert_eq!(intsrc_count, IOAPIC_NUM_PINS);
+        assert_eq!(usize::from(max_dstirq), IOAPIC_NUM_PINS - 1);
+        assert_eq!(layout::IRQ_MAX as usize, IOAPIC_NUM_PINS - 1);
     }
 
     #[test]
